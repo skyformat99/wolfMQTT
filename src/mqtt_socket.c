@@ -1,6 +1,6 @@
 /* mqtt_socket.c
  *
- * Copyright (C) 2006-2016 wolfSSL Inc.
+ * Copyright (C) 2006-2018 wolfSSL Inc.
  *
  * This file is part of wolfMQTT.
  *
@@ -46,13 +46,15 @@ static int MqttSocket_TlsSocketReceive(WOLFSSL* ssl, char *buf, int sz,
     int rc;
     MqttClient *client = (MqttClient*)ptr;
     (void)ssl; /* Not used */
+
     rc = client->net->read(client->net->context, (byte*)buf, sz,
-        client->cmd_timeout_ms);
+        client->tls.timeout_ms);
 
     /* save network read response */
-    client->net->sockRc = rc;
+    client->tls.sockRc = rc;
 
-    if (rc == 0 || rc == MQTT_CODE_ERROR_TIMEOUT || rc == MQTT_CODE_STDIN_WAKE) {
+    if (rc == 0 || rc == MQTT_CODE_ERROR_TIMEOUT || rc == MQTT_CODE_STDIN_WAKE
+                                                 || rc == MQTT_CODE_CONTINUE) {
         rc = WOLFSSL_CBIO_ERR_WANT_READ;
     }
     else if (rc < 0) {
@@ -69,12 +71,12 @@ static int MqttSocket_TlsSocketSend(WOLFSSL* ssl, char *buf, int sz,
     (void)ssl; /* Not used */
 
     rc = client->net->write(client->net->context, (byte*)buf, sz,
-        client->cmd_timeout_ms);
+        client->tls.timeout_ms);
 
     /* save network write response */
-    client->net->sockRc = rc;
+    client->tls.sockRc = rc;
 
-    if (rc == 0 || rc == MQTT_CODE_ERROR_TIMEOUT) {
+    if (rc == 0 || rc == MQTT_CODE_ERROR_TIMEOUT || rc == MQTT_CODE_CONTINUE) {
         rc = WOLFSSL_CBIO_ERR_WANT_WRITE;
     }
     else if (rc < 0) {
@@ -96,30 +98,25 @@ int MqttSocket_Init(MqttClient *client, MqttNet *net)
     #ifdef ENABLE_MQTT_TLS
         client->tls.ctx = NULL;
         client->tls.ssl = NULL;
+        client->tls.timeout_ms = client->cmd_timeout_ms;
     #endif
 
         /* Validate callbacks are not null! */
-        if (net && net->connect && net->read && net->write &&
-            net->disconnect) {
+        if (net && net->connect && net->read && net->write && net->disconnect) {
             rc = MQTT_CODE_SUCCESS;
         }
     }
     return rc;
 }
 
-int MqttSocket_Write(MqttClient *client, const byte* buf, int buf_len,
+static int MqttSocket_WriteDo(MqttClient *client, const byte* buf, int buf_len,
     int timeout_ms)
 {
     int rc;
 
-    /* Validate arguments */
-    if (client == NULL || client->net == NULL ||
-        client->net->write == NULL || buf == NULL || buf_len <= 0) {
-        return MQTT_CODE_ERROR_BAD_ARG;
-    }
-
 #ifdef ENABLE_MQTT_TLS
     if (client->flags & MQTT_CLIENT_FLAG_IS_TLS) {
+        client->tls.timeout_ms = timeout_ms;
         rc = wolfSSL_write(client->tls.ssl, (char*)buf, buf_len);
         if (rc < 0) {
         #ifdef WOLFMQTT_DEBUG_SOCKET
@@ -128,7 +125,7 @@ int MqttSocket_Write(MqttClient *client, const byte* buf, int buf_len,
         #endif
 
             /* return code from net callback */
-            rc = client->net->sockRc;
+            rc = client->tls.sockRc;
         }
     }
     else
@@ -139,37 +136,83 @@ int MqttSocket_Write(MqttClient *client, const byte* buf, int buf_len,
     }
 
 #ifdef WOLFMQTT_DEBUG_SOCKET
-    if (rc != 0) { /* hide in non-blocking case */
+    if (rc != 0 && rc != MQTT_CODE_CONTINUE) { /* hide in non-blocking case */
         PRINTF("MqttSocket_Write: Len=%d, Rc=%d", buf_len, rc);
-    }
-#endif
-
-#ifdef WOLFMQTT_NONBLOCK
-    if (rc == 0) {
-        rc = MQTT_CODE_CONTINUE;
     }
 #endif
 
     return rc;
 }
 
-static int MqttSocket_ReadDo(MqttClient *client, byte* buf, int buf_len, int timeout_ms)
+int MqttSocket_Write(MqttClient *client, const byte* buf, int buf_len,
+    int timeout_ms)
+{
+    int rc;
+
+    /* Validate arguments */
+    if (client == NULL || client->net == NULL || client->net->write == NULL ||
+        buf == NULL || buf_len <= 0) {
+        return MQTT_CODE_ERROR_BAD_ARG;
+    }
+
+    /* check for buffer position overflow */
+    if (client->write.pos >= buf_len) {
+        return MQTT_CODE_ERROR_OUT_OF_BUFFER;
+    }
+
+#ifdef WOLFMQTT_NONBLOCK
+    rc = MqttSocket_WriteDo(client, &buf[client->write.pos],
+        buf_len - client->write.pos, timeout_ms);
+    if (rc >= 0) {
+        client->write.pos += rc;
+        if (client->write.pos < buf_len) {
+            rc = MQTT_CODE_CONTINUE;
+        }
+    }
+    else if (rc == EWOULDBLOCK || rc == EAGAIN) {
+        rc = MQTT_CODE_CONTINUE;
+    }
+
+#else
+    do {
+        rc = MqttSocket_WriteDo(client, &buf[client->write.pos],
+            buf_len - client->write.pos, timeout_ms);
+        if (rc <= 0) {
+            break;
+        }
+        client->write.pos += rc;
+    } while (client->write.pos < buf_len);
+#endif /* WOLFMQTT_NONBLOCK */
+
+    /* handle return code */
+    if (rc > 0) {
+        /* return length write and reset position */
+        rc = client->write.pos;
+        client->write.pos = 0;
+    }
+
+    return rc;
+}
+
+static int MqttSocket_ReadDo(MqttClient *client, byte* buf, int buf_len,
+    int timeout_ms)
 {
     int rc;
 
 #ifdef ENABLE_MQTT_TLS
     if (client->flags & MQTT_CLIENT_FLAG_IS_TLS) {
+        client->tls.timeout_ms = timeout_ms;
         rc = wolfSSL_read(client->tls.ssl, (char*)buf, buf_len);
         if (rc < 0) {
         #ifdef WOLFMQTT_DEBUG_SOCKET
             int error = wolfSSL_get_error(client->tls.ssl, 0);
-            if (error != SSL_ERROR_WANT_READ) {
+            if (error != WOLFSSL_ERROR_WANT_READ) {
                 PRINTF("MqttSocket_Read: SSL Error=%d", error);
             }
         #endif
 
             /* return code from net callback */
-            rc = client->net->sockRc;
+            rc = client->tls.sockRc;
         }
     }
     else
@@ -179,7 +222,7 @@ static int MqttSocket_ReadDo(MqttClient *client, byte* buf, int buf_len, int tim
     }
 
 #ifdef WOLFMQTT_DEBUG_SOCKET
-    if (rc != 0) { /* hide in non-blocking case */
+    if (rc != 0 && rc != MQTT_CODE_CONTINUE) { /* hide in non-blocking case */
         PRINTF("MqttSocket_Read: Len=%d, Rc=%d", buf_len, rc);
     }
 #endif
@@ -198,7 +241,7 @@ int MqttSocket_Read(MqttClient *client, byte* buf, int buf_len, int timeout_ms)
     }
 
     /* check for buffer position overflow */
-    if (client->read.pos > buf_len) {
+    if (client->read.pos >= buf_len) {
         return MQTT_CODE_ERROR_OUT_OF_BUFFER;
     }
 
@@ -211,7 +254,7 @@ int MqttSocket_Read(MqttClient *client, byte* buf, int buf_len, int timeout_ms)
             rc = MQTT_CODE_CONTINUE;
         }
     }
-    else if (rc == EWOULDBLOCK) {
+    else if (rc == EWOULDBLOCK || rc == EAGAIN) {
         rc = MQTT_CODE_CONTINUE;
     }
 
@@ -236,6 +279,36 @@ int MqttSocket_Read(MqttClient *client, byte* buf, int buf_len, int timeout_ms)
     return rc;
 }
 
+#ifdef WOLFMQTT_SN
+int MqttSocket_Peek(MqttClient *client, byte* buf, int buf_len, int timeout_ms)
+{
+    int rc;
+
+    /* Validate arguments */
+    if (client == NULL || client->net == NULL || client->net->peek == NULL ||
+        buf == NULL || buf_len <= 0) {
+        return MQTT_CODE_ERROR_BAD_ARG;
+    }
+
+    /* check for buffer position overflow */
+    if (client->read.pos >= buf_len) {
+        return MQTT_CODE_ERROR_OUT_OF_BUFFER;
+    }
+
+    rc = client->net->peek(client->net->context, buf, buf_len, timeout_ms);
+    if (rc > 0) {
+    #ifdef WOLFMQTT_DEBUG_SOCKET
+        PRINTF("MqttSocket_Peek: Len=%d, Rc=%d", buf_len, rc);
+    #endif
+
+        /* return length read and reset position */
+        client->read.pos = 0;
+    }
+
+    return rc;
+}
+#endif
+
 int MqttSocket_Connect(MqttClient *client, const char* host, word16 port,
     int timeout_ms, int use_tls, MqttTlsCb cb)
 {
@@ -246,6 +319,14 @@ int MqttSocket_Connect(MqttClient *client, const char* host, word16 port,
         client->net->connect == NULL) {
         return MQTT_CODE_ERROR_BAD_ARG;
     }
+
+#ifndef ENABLE_MQTT_TLS
+    /* cannot use TLS unless ENABLE_MQTT_TLS is defined */
+    if (use_tls) {
+        return MQTT_CODE_ERROR_BAD_ARG;
+    }
+#endif
+
 
     if ((client->flags & MQTT_CLIENT_FLAG_IS_CONNECTED) == 0) {
         /* Validate port */
@@ -273,11 +354,11 @@ int MqttSocket_Connect(MqttClient *client, const char* host, word16 port,
 
             /* Issue callback to allow setup of the wolfSSL_CTX and cert
                verification settings */
-            rc = SSL_SUCCESS;
+            rc = WOLFSSL_SUCCESS;
             if (cb) {
                 rc = cb(client);
             }
-            if (rc != SSL_SUCCESS) {
+            if (rc != WOLFSSL_SUCCESS) {
                 rc = MQTT_CODE_ERROR_TLS_CONNECT;
                 goto exit;
             }
@@ -291,7 +372,7 @@ int MqttSocket_Connect(MqttClient *client, const char* host, word16 port,
                 rc = -1;
                 goto exit;
             }
-            wolfSSL_CTX_set_verify(client->tls.ctx, SSL_VERIFY_NONE, 0);
+            wolfSSL_CTX_set_verify(client->tls.ctx, WOLFSSL_VERIFY_NONE, 0);
         }
 
     #ifndef NO_DH
@@ -317,8 +398,13 @@ int MqttSocket_Connect(MqttClient *client, const char* host, word16 port,
         #endif
         }
 
+        if (client->ctx != NULL) {
+            /* Store any app data for use by the tls verify callback*/
+            wolfSSL_SetCertCbCtx(client->tls.ssl, client->ctx);
+        }
+
         rc = wolfSSL_connect(client->tls.ssl);
-        if (rc != SSL_SUCCESS) {
+        if (rc != WOLFSSL_SUCCESS) {
             goto exit;
         }
 
@@ -329,21 +415,25 @@ int MqttSocket_Connect(MqttClient *client, const char* host, word16 port,
 exit:
     /* Handle error case */
     if (rc) {
-    #ifndef WOLFMQTT_NO_STDIO
+    #ifdef WOLFMQTT_DEBUG_SOCKET
     	const char* errstr = NULL;
+    #endif
         int errnum = 0;
         if (client->tls.ssl) {
             errnum = wolfSSL_get_error(client->tls.ssl, 0);
-            if ((errnum == SSL_ERROR_WANT_READ) ||
-                (errnum == SSL_ERROR_WANT_WRITE)) {
+            if ((errnum == WOLFSSL_ERROR_WANT_READ) ||
+                (errnum == WOLFSSL_ERROR_WANT_WRITE)) {
                 return MQTT_CODE_CONTINUE;
             }
+        #ifdef WOLFMQTT_DEBUG_SOCKET
             errstr = wolfSSL_ERR_reason_error_string(errnum);
+        #endif
         }
 
+    #ifdef WOLFMQTT_DEBUG_SOCKET
         PRINTF("MqttSocket_TlsConnect Error %d: Num %d, %s",
             rc, errnum, errstr);
-    #endif /* WOLFMQTT_NO_STDIO */
+    #endif /* WOLFMQTT_DEBUG_SOCKET */
 
         /* Make sure we cleanup on error */
         MqttSocket_Disconnect(client);
@@ -372,8 +462,14 @@ int MqttSocket_Disconnect(MqttClient *client)
     int rc = MQTT_CODE_SUCCESS;
     if (client) {
     #ifdef ENABLE_MQTT_TLS
-        if (client->tls.ssl) wolfSSL_free(client->tls.ssl);
-        if (client->tls.ctx) wolfSSL_CTX_free(client->tls.ctx);
+        if (client->tls.ssl) {
+            wolfSSL_free(client->tls.ssl);
+            client->tls.ssl = NULL;
+        }
+        if (client->tls.ctx) {
+            wolfSSL_CTX_free(client->tls.ctx);
+            client->tls.ctx = NULL;
+        }
         wolfSSL_Cleanup();
         client->flags &= ~MQTT_CLIENT_FLAG_IS_TLS;
     #endif

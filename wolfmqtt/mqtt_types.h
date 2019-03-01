@@ -1,6 +1,6 @@
 /* mqtt_types.h
  *
- * Copyright (C) 2006-2016 wolfSSL Inc.
+ * Copyright (C) 2006-2018 wolfSSL Inc.
  *
  * This file is part of wolfMQTT.
  *
@@ -27,6 +27,18 @@
 #ifndef WOLFMQTT_TYPES_H
 #define WOLFMQTT_TYPES_H
 
+/* configuration for Arduino */
+#ifdef ARDUINO
+/* Uncomment this to enable TLS support */
+/* Make sure and include the wolfSSL library */
+    //#define ENABLE_MQTT_TLS
+
+    /* make sure arduino can see the wolfssl library directory */
+    #ifdef ENABLE_MQTT_TLS
+        #include <wolfssl.h>
+    #endif
+#endif
+
 #ifdef __cplusplus
     extern "C" {
 #endif
@@ -42,12 +54,15 @@
         #define WOLFMQTT_NONBLOCK
     #endif
 
-    /* use SYS_PRINT for printf */
-    #define WOLFMQTT_CUSTOM_PRINTF
-    #define PRINTF(_f_, ...)  SYS_PRINT( (_f_ "\n"), ##__VA_ARGS__)
+	#include "system_config.h"
+    #ifdef SYS_CMD_ENABLE
+        extern void SYS_CMD_PRINT(const char *format, ...);
+  
+        /* use SYS_PRINT for printf */
+        #define WOLFMQTT_CUSTOM_PRINTF
+        #define PRINTF(_f_, ...)  SYS_CMD_PRINT( (_f_ "\n"), ##__VA_ARGS__)
+    #endif
 
-    #include "system_config.h"
-    #include "system_definitions.h"
 #endif
 
 #ifdef _WIN32
@@ -57,6 +72,14 @@
     #ifndef _WIN32_WINNT
         #define _WIN32_WINNT 0x0501
     #endif
+
+    /* Allow "unsafe" strncpy */
+    #ifndef _CRT_SECURE_NO_WARNINGS
+        #define _CRT_SECURE_NO_WARNINGS
+    #endif
+
+    /* Visual Studio build settings from wolfmqtt/vs_settings.h */
+    #include "wolfmqtt/vs_settings.h"
 #endif
 
 #ifndef WOLFMQTT_NO_STDIO
@@ -91,6 +114,9 @@ enum MqttPacketResponseCodes {
     MQTT_CODE_ERROR_NETWORK = -8,
     MQTT_CODE_ERROR_MEMORY = -9,
     MQTT_CODE_ERROR_STAT = -10,
+    MQTT_CODE_ERROR_PROPERTY = -11,
+    MQTT_CODE_ERROR_SERVER_PROP = -12,
+    MQTT_CODE_ERROR_CALLBACK = -13,
 
     MQTT_CODE_CONTINUE = -101,
     MQTT_CODE_STDIN_WAKE = -102,
@@ -100,6 +126,7 @@ enum MqttPacketResponseCodes {
 /* Standard wrappers */
 #ifndef WOLFMQTT_CUSTOM_STRING
     #include <string.h>
+
     #ifndef XSTRLEN
         #define XSTRLEN(s1)         strlen((s1))
     #endif
@@ -109,11 +136,17 @@ enum MqttPacketResponseCodes {
     #ifndef XSTRNCMP
         #define XSTRNCMP(s1,s2,n)   strncmp((s1),(s2),(n))
     #endif
+    #ifndef XSTRNCPY
+        #define XSTRNCPY(s1,s2,n)   strncpy((s1),(s2),(n))
+    #endif
     #ifndef XMEMCPY
         #define XMEMCPY(d,s,l)      memcpy((d),(s),(l))
     #endif
     #ifndef XMEMSET
         #define XMEMSET(b,c,l)      memset((b),(c),(l))
+    #endif
+    #ifndef XMEMCMP
+        #define XMEMCMP(s1,s2,n)    memcmp((s1),(s2),(n))
     #endif
     #ifndef XATOI
         #define XATOI(s)            atoi((s))
@@ -184,6 +217,16 @@ enum MqttPacketResponseCodes {
     #endif
 #endif
 
+/* GCC 7 has new switch() fall-through detection */
+/* default to FALL_THROUGH stub */
+#define FALL_THROUGH
+
+#if defined(__GNUC__)
+    #if ((__GNUC__ > 7) || ((__GNUC__ == 7) && (__GNUC_MINOR__ >= 1)))
+        #undef  FALL_THROUGH
+        #define FALL_THROUGH __attribute__ ((fallthrough));
+    #endif
+#endif
 
 #ifdef __cplusplus
     } /* extern "C" */

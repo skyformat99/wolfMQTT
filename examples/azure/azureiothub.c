@@ -1,6 +1,6 @@
 /* azureiothub.c
  *
- * Copyright (C) 2006-2016 wolfSSL Inc.
+ * Copyright (C) 2006-2018 wolfSSL Inc.
  *
  * This file is part of wolfMQTT.
  *
@@ -40,7 +40,10 @@
 
 /* This example requires features in wolfSSL 3.9.1 or later */
 #if defined(ENABLE_MQTT_TLS)
-    #include <wolfssl/options.h>
+    #if !defined(WOLFSSL_USER_SETTINGS) && !defined(USE_WINDOWS_API)
+        #include <wolfssl/options.h>
+    #endif
+    #include <wolfssl/wolfcrypt/settings.h>
     #include <wolfssl/version.h>
 
     #if defined(LIBWOLFSSL_VERSION_HEX) && \
@@ -79,6 +82,7 @@ static int mStopRead = 0;
 #define AZURE_KEEP_ALIVE_SEC    DEFAULT_KEEP_ALIVE_SEC
 #define AZURE_CMD_TIMEOUT_MS    DEFAULT_CMD_TIMEOUT_MS
 #define AZURE_TOKEN_EXPIRY_SEC  (60 * 60 * 1) /* 1 hour */
+#define AZURE_TOKEN_SIZE        400
 
 #define AZURE_DEVICE_NAME       AZURE_HOST"/devices/"AZURE_DEVICE_ID
 #define AZURE_USERNAME          AZURE_HOST"/"AZURE_DEVICE_ID
@@ -164,14 +168,14 @@ static int SasTokenCreate(char* sasToken, int sasTokenLen)
 {
     int rc;
     const char* encodedKey = AZURE_KEY;
-    byte decodedKey[SHA256_DIGEST_SIZE+1];
+    byte decodedKey[WC_SHA256_DIGEST_SIZE+1];
     word32 decodedKeyLen = (word32)sizeof(decodedKey);
     char deviceName[150]; /* uri */
     char sigData[200]; /* max uri + expiration */
-    byte sig[SHA256_DIGEST_SIZE];
-    byte base64Sig[SHA256_DIGEST_SIZE*2];
+    byte sig[WC_SHA256_DIGEST_SIZE];
+    byte base64Sig[WC_SHA256_DIGEST_SIZE*2];
     word32 base64SigLen = (word32)sizeof(base64Sig);
-    byte encodedSig[SHA256_DIGEST_SIZE*4];
+    byte encodedSig[WC_SHA256_DIGEST_SIZE*4];
     long lTime;
     Hmac hmac;
 
@@ -201,7 +205,7 @@ static int SasTokenCreate(char* sasToken, int sasTokenLen)
     XSNPRINTF(sigData, sizeof(sigData), AZURE_SIG_FMT, deviceName, lTime);
 
     /* HMAC-SHA256 Hash sigData using decoded key */
-    rc = wc_HmacSetKey(&hmac, SHA256, decodedKey, decodedKeyLen);
+    rc = wc_HmacSetKey(&hmac, WC_SHA256, decodedKey, decodedKeyLen);
     if (rc < 0) {
         PRINTF("SasTokenCreate: Hmac setkey failed! %d", rc);
         return rc;
@@ -249,6 +253,8 @@ int azureiothub_test(MQTTCtx *mqttCtx)
             if (!mqttCtx->use_tls) {
                 return MQTT_CODE_ERROR_BAD_ARG;
             }
+
+            FALL_THROUGH;
         }
 
         case WMQ_NET_INIT:
@@ -256,7 +262,7 @@ int azureiothub_test(MQTTCtx *mqttCtx)
             mqttCtx->stat = WMQ_NET_INIT;
 
             /* Initialize Network */
-            rc = MqttClientNet_Init(&mqttCtx->net);
+            rc = MqttClientNet_Init(&mqttCtx->net, mqttCtx);
             if (rc == MQTT_CODE_CONTINUE) {
                 return rc;
             }
@@ -274,11 +280,12 @@ int azureiothub_test(MQTTCtx *mqttCtx)
             url_encoder_init();
 
             /* build sas token for password */
-            rc = SasTokenCreate(mqttCtx->buffer.sasToken,
-                (int)sizeof(mqttCtx->buffer.sasToken));
+            rc = SasTokenCreate((char*)mqttCtx->app_ctx, AZURE_TOKEN_SIZE);
             if (rc < 0) {
                 goto exit;
             }
+
+            FALL_THROUGH;
         }
 
         case WMQ_INIT:
@@ -298,6 +305,8 @@ int azureiothub_test(MQTTCtx *mqttCtx)
                 goto exit;
             }
             mqttCtx->client.ctx = mqttCtx;
+
+            FALL_THROUGH;
         }
 
         case WMQ_TCP_CONN:
@@ -315,12 +324,8 @@ int azureiothub_test(MQTTCtx *mqttCtx)
             if (rc != MQTT_CODE_SUCCESS) {
                 goto exit;
             }
-        }
 
-        case WMQ_MQTT_CONN:
-        {
-            mqttCtx->stat = WMQ_MQTT_CONN;
-
+            /* Build connect packet */
             XMEMSET(&mqttCtx->connect, 0, sizeof(MqttConnect));
             mqttCtx->connect.keep_alive_sec = mqttCtx->keep_alive_sec;
             mqttCtx->connect.clean_session = mqttCtx->clean_session;
@@ -342,7 +347,14 @@ int azureiothub_test(MQTTCtx *mqttCtx)
 
             /* Authentication */
             mqttCtx->connect.username = AZURE_USERNAME;
-            mqttCtx->connect.password = mqttCtx->buffer.sasToken;
+            mqttCtx->connect.password = (const char *)mqttCtx->app_ctx;
+
+            FALL_THROUGH;
+        }
+
+        case WMQ_MQTT_CONN:
+        {
+            mqttCtx->stat = WMQ_MQTT_CONN;
 
             /* Send Connect and wait for Connect Ack */
             rc = MqttClient_Connect(&mqttCtx->client, &mqttCtx->connect);
@@ -369,9 +381,12 @@ int azureiothub_test(MQTTCtx *mqttCtx)
 
             /* Subscribe Topic */
             XMEMSET(&mqttCtx->subscribe, 0, sizeof(MqttSubscribe));
+            mqttCtx->subscribe.stat = MQTT_MSG_BEGIN;
             mqttCtx->subscribe.packet_id = mqtt_get_packetid();
             mqttCtx->subscribe.topic_count = sizeof(mqttCtx->topics)/sizeof(MqttTopic);
             mqttCtx->subscribe.topics = mqttCtx->topics;
+
+            FALL_THROUGH;
         }
 
         case WMQ_SUB:
@@ -405,6 +420,8 @@ int azureiothub_test(MQTTCtx *mqttCtx)
             mqttCtx->publish.packet_id = mqtt_get_packetid();
             mqttCtx->publish.buffer = NULL;
             mqttCtx->publish.total_len = 0;
+
+            FALL_THROUGH;
         }
 
         case WMQ_PUB:
@@ -423,6 +440,8 @@ int azureiothub_test(MQTTCtx *mqttCtx)
 
             /* Read Loop */
             PRINTF("MQTT Waiting for message...");
+
+            FALL_THROUGH;
         }
 
         case WMQ_WAIT_MSG:
@@ -430,15 +449,15 @@ int azureiothub_test(MQTTCtx *mqttCtx)
             mqttCtx->stat = WMQ_WAIT_MSG;
 
             do {
-                /* Try and read packet */
-                rc = MqttClient_WaitMessage(&mqttCtx->client, mqttCtx->cmd_timeout_ms);
-
                 /* check for test mode or stop */
                 if (mStopRead || mqttCtx->test_mode) {
                     rc = MQTT_CODE_SUCCESS;
                     PRINTF("MQTT Exiting...");
                     break;
                 }
+
+                /* Try and read packet */
+                rc = MqttClient_WaitMessage(&mqttCtx->client, mqttCtx->cmd_timeout_ms);
 
             #ifdef WOLFMQTT_NONBLOCK
                 /* Track elapsed time with no activity and trigger timeout */
@@ -500,6 +519,8 @@ int azureiothub_test(MQTTCtx *mqttCtx)
             if (rc != MQTT_CODE_SUCCESS) {
                 goto disconn;
             }
+
+            FALL_THROUGH;
         }
 
         case WMQ_DISCONNECT:
@@ -514,6 +535,8 @@ int azureiothub_test(MQTTCtx *mqttCtx)
             if (rc != MQTT_CODE_SUCCESS) {
                 goto disconn;
             }
+
+            FALL_THROUGH;
         }
 
         case WMQ_NET_DISCONNECT:
@@ -526,6 +549,8 @@ int azureiothub_test(MQTTCtx *mqttCtx)
             }
             PRINTF("MQTT Socket Disconnect: %s (%d)",
                 MqttClient_ReturnCodeToString(rc), rc);
+
+            FALL_THROUGH;
         }
 
         case WMQ_DONE:
@@ -596,6 +621,7 @@ exit:
         int rc;
     #ifdef ENABLE_AZUREIOTHUB_EXAMPLE
         MQTTCtx mqttCtx;
+        char sasToken[AZURE_TOKEN_SIZE] = {0};
 
         /* init defaults */
         mqtt_init_ctx(&mqttCtx);
@@ -607,6 +633,7 @@ exit:
         mqttCtx.topic_name = AZURE_MSGS_TOPIC_NAME;
         mqttCtx.cmd_timeout_ms = AZURE_CMD_TIMEOUT_MS;
         mqttCtx.use_tls = 1;
+        mqttCtx.app_ctx = (void*)sasToken;
 
         /* parse arguments */
         rc = mqtt_parse_args(&mqttCtx, argc, argv);

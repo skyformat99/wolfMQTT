@@ -1,6 +1,6 @@
 /* mqtt_socket.h
  *
- * Copyright (C) 2006-2016 wolfSSL Inc.
+ * Copyright (C) 2006-2018 wolfSSL Inc.
  *
  * This file is part of wolfMQTT.
  *
@@ -33,7 +33,10 @@
 
 #include "wolfmqtt/mqtt_types.h"
 #ifdef ENABLE_MQTT_TLS
-    #include <wolfssl/options.h>
+    #if !defined(WOLFSSL_USER_SETTINGS) && !defined(USE_WINDOWS_API)
+        #include <wolfssl/options.h>
+    #endif
+	#include <wolfssl/wolfcrypt/settings.h>
     #include <wolfssl/ssl.h>
     #include <wolfssl/wolfcrypt/types.h>
 
@@ -62,13 +65,19 @@ typedef int (*MqttNetWriteCb)(void *context,
     const byte* buf, int buf_len, int timeout_ms);
 typedef int (*MqttNetReadCb)(void *context,
     byte* buf, int buf_len, int timeout_ms);
+#ifdef WOLFMQTT_SN
+typedef int (*MqttNetPeekCb)(void *context,
+    byte* buf, int buf_len, int timeout_ms);
+#endif
 typedef int (*MqttNetDisconnectCb)(void *context);
 
-/* Strucutre for Network Security */
+/* Structure for Network Security */
 #ifdef ENABLE_MQTT_TLS
 typedef struct _MqttTls {
     WOLFSSL_CTX         *ctx;
     WOLFSSL             *ssl;
+    int                 sockRc;
+    int                 timeout_ms;
 } MqttTls;
 #endif
 
@@ -79,20 +88,27 @@ typedef struct _MqttNet {
     MqttNetReadCb       read;
     MqttNetWriteCb      write;
     MqttNetDisconnectCb disconnect;
-    int                 sockRc;
+#ifdef WOLFMQTT_SN
+    MqttNetPeekCb       peek;
+    void                *multi_ctx;
+#endif
 } MqttNet;
 
 
 /* MQTT SOCKET APPLICATION INTERFACE */
-int MqttSocket_Init(struct _MqttClient *client, MqttNet* net);
-int MqttSocket_Write(struct _MqttClient *client, const byte* buf, int buf_len,
-    int timeout_ms);
-int MqttSocket_Read(struct _MqttClient *client, byte* buf, int buf_len,
-    int timeout_ms);
-
-int MqttSocket_Connect(struct _MqttClient *client, const char* host,
-    word16 port, int timeout_ms, int use_tls, MqttTlsCb cb);
-int MqttSocket_Disconnect(struct _MqttClient *client);
+WOLFMQTT_LOCAL int MqttSocket_Init(struct _MqttClient *client, MqttNet* net);
+WOLFMQTT_LOCAL int MqttSocket_Write(struct _MqttClient *client, const byte* buf,
+        int buf_len, int timeout_ms);
+WOLFMQTT_LOCAL int MqttSocket_Read(struct _MqttClient *client, byte* buf,
+        int buf_len, int timeout_ms);
+#ifdef WOLFMQTT_SN
+WOLFMQTT_LOCAL int MqttSocket_Peek(struct _MqttClient *client, byte* buf,
+        int buf_len, int timeout_ms);
+#endif
+WOLFMQTT_LOCAL int MqttSocket_Connect(struct _MqttClient *client,
+        const char* host, word16 port, int timeout_ms, int use_tls,
+        MqttTlsCb cb);
+WOLFMQTT_LOCAL int MqttSocket_Disconnect(struct _MqttClient *client);
 
 
 #ifdef __cplusplus

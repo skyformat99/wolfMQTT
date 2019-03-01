@@ -51,6 +51,7 @@ diff
 # scan-build
 client.plist
 examples/mqttclient/mqttclient
+examples/nbclient/nbclient
 Debug
 .vs
 *.aps
@@ -64,3 +65,7 @@ firmware.bin
 IDE/ARDUINO/wolfMQTT
 examples/azure/azureiothub
 examples/aws/awsiot
+examples/wiot/wiot
+wolfmqtt/options.h
+/IDE/Microchip-Harmony/wolfmqtt_client/firmware/mqtt_client.X/dist/default/
+examples/sn-client/sn-client
